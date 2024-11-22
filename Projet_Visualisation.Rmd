@@ -1,0 +1,369 @@
+---
+title: "Exploration et visualisation des donnees sur les endives  "
+output: html_document
+date: "2024-11-22"
+---
+
+
+# Importation et traitement des donnees : 
+
+```{r}
+#install.packages("jsonlite")
+library(jsonlite)
+library(dplyr)
+library(explore)
+library(writexl)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(sf)
+library(ggforce)
+#read.table("output_1_2021_Endive")
+data_1_2021 <- fromJSON("output_1_2021_Endive.json")
+data_2_2021 <- fromJSON("output_2_2021_Endive.json")
+data_3_2021 <- fromJSON("output_3_2021_Endive.json")
+data_1_2022 <- fromJSON("output_1_2022_Endive.json")
+data_2_2022 <- fromJSON("output_2_2022_Endive.json")
+data_3_2022 <- fromJSON("output_3_2022_Endive.json")
+
+big_data <- bind_rows(data_1_2021, data_2_2021, data_3_2021, data_1_2022, data_2_2022, 
+                      data_3_2022)
+colnames(data_3_2022)
+
+```
+
+
+## Graph 1 : Carte de distribution des endives en France métropolitaine sur les années 2021 et 2022 
+
+```{r}
+
+big_data$departement <- substr(big_data$distributionZipCode, 1, 2)
+
+# Convertir g. en Kg.
+big_data$productConditioningUnit <- gsub("g\\.", "Kg.", big_data$productConditioningUnit)
+
+# Convertir les grammes en kilogrammes
+big_data$productConditioningQuantity[big_data$productConditioningUnit == "Kg."] <- 
+  big_data$productConditioningQuantity[big_data$productConditioningUnit == "Kg."] / 1000
+
+big_data$productConditioningUnit <- gsub("KKg\\.", "Kg.", big_data$productConditioningUnit)
+
+big_data$total_quantity <- ifelse(
+  big_data$productConditioningUnit == "Pièce",
+  NA,  # Mettre NA pour les lignes en "Pièce"
+  big_data$orderQuantity * big_data$productConditioningQuantity
+)
+
+# Préparation des données comme avant jusqu'à prix_quantity_bio_dept
+prix_quantity_bio_dept <- big_data %>%
+  filter(departement != "" & departement != "00") %>%
+  group_by(departement) %>%
+  summarise(
+    prix_moyen = mean(orderProductPrice, na.rm = TRUE),
+    quantite_totale = sum(total_quantity, na.rm = TRUE),
+    prop_bio = mean(productIsOrganic == TRUE, na.rm = TRUE),
+    only_piece = all(productConditioningUnit == "Pièce")
+  )
+
+# Charger la carte et ajouter les coordonnées
+france_dept <- st_read("contour-des-departements.geojson")
+dept_centroids <- st_coordinates(st_centroid(france_dept))
+
+# Définir les offsets pour le positionnement des camemberts
+offset_X <- 0  # Ajuster si nécessaire
+offset_Y <- 0  # Ajuster si nécessaire
+
+# Préparer les données pour les camemberts
+pie_data <- prix_quantity_bio_dept %>%
+  mutate(
+    X = dept_centroids[match(departement, france_dept$code), 1],
+    Y = dept_centroids[match(departement, france_dept$code), 2],
+    proportion_nonbio = 1 - prop_bio
+  )
+
+# Créer une nouvelle colonne pour la visualisation
+france_dept_with_stats <- france_dept %>%
+  left_join(prix_quantity_bio_dept, by = c("code" = "departement")) %>%
+  mutate(
+    fill_value = case_when(
+      is.na(prix_moyen) ~ NA_real_,
+      only_piece ~ -1,  # Valeur spéciale pour les départements en pièces uniquement
+      TRUE ~ prix_moyen
+    )
+  )
+
+# Créer un contour extérieur de la France
+france_outline <- st_union(france_dept_with_stats)
+
+# Créer le graphique principal
+graphique <- ggplot() +
+  # Départements avec données
+  geom_sf(data = france_dept_with_stats, 
+          aes(fill = fill_value),
+          color = ifelse(is.na(france_dept_with_stats$prix_moyen), NA, "black")) +
+  # Contour de la France
+  geom_sf(data = france_outline, 
+          fill = NA, 
+          color = "black",
+          size = 1) +
+  # Points pour départements 100% bio
+  geom_point(data = subset(pie_data, prop_bio == 1 & !only_piece & !is.na(prix_moyen)),
+             aes(x = X + offset_X, y = Y + offset_Y, size = quantite_totale),
+             fill = "chartreuse", color = "black", shape = 21, stroke = 0.5) +
+  # Points pour départements 0% bio
+  geom_point(data = subset(pie_data, prop_bio == 0 & !only_piece & !is.na(prix_moyen)),
+             aes(x = X + offset_X, y = Y + offset_Y, size = quantite_totale),
+             fill = "gray60", color = "black", shape = 21, stroke = 0.5) +
+  # Camemberts pour proportions bio
+  geom_arc_bar(data = subset(pie_data, prop_bio > 0 & prop_bio < 1 & !only_piece & !is.na(prix_moyen)),
+               aes(x0 = X + offset_X, y0 = Y + offset_Y,
+                   r0 = 0,
+                   r = sqrt(quantite_totale)/40,
+                   start = 0, end = prop_bio * 2 * pi),
+               fill = "chartreuse", color = "black") +
+  geom_arc_bar(data = subset(pie_data, prop_bio > 0 & prop_bio < 1 & !only_piece & !is.na(prix_moyen)),
+               aes(x0 = X + offset_X, y0 = Y + offset_Y,
+                   r0 = 0,
+                   r = sqrt(quantite_totale)/40,
+                   start = prop_bio * 2 * pi, end = 2 * pi),
+               fill = "gray60", color = "black") +
+  # Échelles et légendes
+  scale_fill_gradientn(
+    name = "Prix moyen (€)",
+    colors = c("cadetblue2", viridisLite::rocket(100, direction = -1)),
+    breaks = c(-1, pretty(france_dept_with_stats$prix_moyen[!is.na(france_dept_with_stats$prix_moyen) & 
+                                                              !france_dept_with_stats$only_piece])),
+    labels = c("Pièce uniquement", pretty(france_dept_with_stats$prix_moyen[!is.na(france_dept_with_stats$prix_moyen) & 
+                                                                              !france_dept_with_stats$only_piece])),
+    na.value = "lavenderblush1",
+    limits = c(-1, max(france_dept_with_stats$prix_moyen, na.rm = TRUE))
+  ) +
+  scale_size_continuous(name = "Quantité vendue (en kg)",
+                        range = c(2, 12),
+                        guide = guide_legend(override.aes = list(fill = "transparent", color = "black"))) +
+  theme(aspect.ratio = 0.8) +
+  labs(x = "Longitude", y = "Latitude")
+
+# Afficher le graphique
+graphique
+
+
+```
+
+
+```{r}
+# Fonction pour convertir en kilogrammes
+convert_to_kg <- function(quantity, productConditioningUnit) {
+  if (productConditioningUnit == "g.") {
+    return(quantity / 1000)  # Conversion grammes -> kg
+  } else if (productConditioningUnit == "kg.") {
+    return(quantity)  # Pas de conversion nécessaire pour kg
+  } else if (productConditioningUnit == "Pièce") {
+    return(quantity * 0.05)  # Supposons qu'une pièce pèse 50g
+  } else {
+    return(NA)  # Valeur inconnue, retourne NA
+  }
+}
+
+big_data$productConditioningQuantity_kg <- mapply(convert_to_kg,big_data$productConditioningQuantity,big_data$productConditioningUnit)
+big_data$orderDate <- as.POSIXct(big_data$orderDate)
+big_data$orderDate <- format(big_data$orderDate, "%Y-%m-%dT%H:%M:%S.000Z")
+
+```
+
+
+
+## Graph 2 : Évolution hebdomadaire des quantités et des prix des Endives  Bio (2021 et 2022)
+```{r}
+
+
+# Filtrer et transformer les données pour 2021 et 2022
+agg_data_bio_week <- big_data %>%
+  filter(year %in% c(2021, 2022), productIsOrganic == FALSE) %>%  # Inclure 2021 et 2022
+  mutate(
+    productConditioningQuantity_converted = mapply(convert_to_kg, productConditioningQuantity, productConditioningUnit),  # Conversion en kg
+    week_number = week(orderDate)  # Extraire le numéro de la semaine
+  ) %>%
+  group_by(year, week_number) %>%  # Grouper par année et numéro de semaine
+  summarise(
+    weekly_quantity = sum(orderQuantity * productConditioningQuantity_converted, na.rm = TRUE),  # Quantité hebdomadaire
+    avg_price = mean(orderProductPrice, na.rm = TRUE),  # Prix moyen par semaine
+    .groups = "drop"
+  )
+
+# Facteur pour aligner les axes (quantités et prix)
+price_scale_factor_bio <- max(agg_data_bio_week$weekly_quantity, na.rm = TRUE) / max(agg_data_bio_week$avg_price, na.rm = TRUE)
+
+# Graphique avec des couleurs distinctes pour les barres et les lignes
+ggplot(agg_data_bio_week, aes(x = week_number)) +
+  geom_bar(aes(y = weekly_quantity), stat = "identity", fill = "#E56B4E", alpha = 0.7) +  # Barres en couleur orange foncé
+  geom_smooth(aes(y = avg_price * price_scale_factor_bio), color = "#56B4E9", size = 1, method = "loess", span = 0.3) +  # Courbe en bleu clair (adapté au daltonisme)
+  geom_point(aes(y = avg_price * price_scale_factor_bio), color = "#56B4E9", size = 2) +  # Points en bleu clair
+  facet_wrap(~ year, ncol = 1, scales = "free_y") +  # Superposer les années avec un facet
+  scale_y_continuous(
+    name = "Quantité hebdomadaire (kg)",
+    sec.axis = sec_axis(
+      ~ . / price_scale_factor_bio,
+      name = "Prix moyen (unités)",
+      breaks = seq(0, max(agg_data_bio_week$avg_price, na.rm = TRUE), by = 0.5)  # Échelle des prix avec un pas de 0.5
+    )
+  ) +
+  scale_x_continuous(
+    breaks = seq(1, 52, by = 4),
+    labels = paste("Semaine", seq(1, 52, by = 4)),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Évolution hebdomadaire des quantités et des prix des Endives Non Bio (2021 et 2022)",
+    x = "Semaines"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 1),
+    axis.text.y = element_text(color = "#E56B4E"),  # Couleur des axes correspondant aux barres
+    axis.text.y.right = element_text(color = "#56B4E9"),  # Couleur des axes correspondant aux courbes
+    legend.position = "none"  # Supprimer la légende si non nécessaire
+  )
+
+```
+
+
+```{r}
+
+# Filtrer et transformer les données pour 2021 et 2022
+agg_data_bio_week <- big_data %>%
+  filter(year %in% c(2021, 2022), productIsOrganic == TRUE) %>%  # Inclure 2021 et 2022
+  mutate(
+    productConditioningQuantity_converted = mapply(convert_to_kg, productConditioningQuantity, productConditioningUnit),  # Conversion en kg
+    week_number = week(orderDate)  # Extraire le numéro de la semaine
+  ) %>%
+  group_by(year, week_number) %>%  # Grouper par année et numéro de semaine
+  summarise(
+    weekly_quantity = sum(orderQuantity * productConditioningQuantity_converted, na.rm = TRUE),  # Quantité hebdomadaire
+    avg_price = mean(orderProductPrice, na.rm = TRUE),  # Prix moyen par semaine
+    .groups = "drop"
+  )
+
+# Facteur pour aligner les axes (quantités et prix)
+price_scale_factor_bio <- max(agg_data_bio_week$weekly_quantity, na.rm = TRUE) / max(agg_data_bio_week$avg_price, na.rm = TRUE)
+
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+
+# Graphique avec des couleurs distinctes pour les barres et les lignes
+ggplot(agg_data_bio_week, aes(x = week_number)) +
+  geom_bar(aes(y = weekly_quantity), stat = "identity", fill = "#E56B4E", alpha = 0.7) +  # Barres en couleur orange foncé
+  geom_smooth(aes(y = avg_price * price_scale_factor_bio), color = "#56B4E9", size = 1, method = "loess", span = 0.3) +  # Courbe en bleu clair (adapté au daltonisme)
+  geom_point(aes(y = avg_price * price_scale_factor_bio), color = "#56B4E9", size = 2) +  # Points en bleu clair
+  facet_wrap(~ year, ncol = 1, scales = "free_y") +  # Superposer les années avec un facet
+  scale_y_continuous(
+    name = "Quantité hebdomadaire (kg)",
+    sec.axis = sec_axis(
+      ~ . / price_scale_factor_bio,
+      name = "Prix moyen (unités)",
+      breaks = seq(0, max(agg_data_bio_week$avg_price, na.rm = TRUE), by = 0.5)  # Échelle des prix avec un pas de 0.5
+    )
+  ) +
+  scale_x_continuous(
+    breaks = seq(1, 52, by = 4),
+    labels = paste("Semaine", seq(1, 52, by = 4)),
+    expand = c(0, 0)
+  ) +
+  labs(
+    title = "Évolution hebdomadaire des quantités et des prix des Endives  Bio (2021 et 2022)",
+    x = "Semaines"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 1),
+    axis.text.y = element_text(color = "#E56B4E"),  # Couleur des axes correspondant aux barres
+    axis.text.y.right = element_text(color = "#56B4E9"),  # Couleur des axes correspondant aux courbes
+    legend.position = "none"  # Supprimer la légende si non nécessaire
+  )
+ 
+```
+
+
+
+## Graph 3 : Somme des Quantités par Type d'Unité de vente des endives bio et non bio pour 2021 
+
+```{r}
+
+# Filtrer et transformer les données pour les produits biologiques
+agg_data_bio_month <- big_data %>%
+  filter(year == year_defined, productIsOrganic == TRUE) %>%  # Filtrer pour les produits biologiques
+  mutate(
+    productConditioningQuantity_converted = mapply(convert_to_kg, productConditioningQuantity, productConditioningUnit),  # Conversion en kg
+    month_number = month(orderDate),  # Extraire le numéro du mois
+    month_label = month(orderDate, label = TRUE, abbr = TRUE)  # Extraire le mois avec abréviation (ex: "Jan", "Feb", etc.)
+  ) %>%
+  group_by(month_number, productConditioningUnit) %>%  # Grouper par mois et type d'unité
+  summarise(
+    total_quantity = sum(orderQuantity, na.rm = TRUE),  # Somme des `orderQuantity` par mois et type d'unité
+    count_orders = n(),  # Nombre d'ordres dans chaque groupe
+    .groups = "drop"
+  )
+
+# Créer un graphique avec les mois en x et les histogrammes séparés par `productConditioningUnit`
+ggplot(agg_data_bio_month, aes(x = factor(month_number), y = total_quantity, fill = productConditioningUnit)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +  # Utilisation de `dodge` pour des histogrammes séparés
+  scale_fill_manual(values = c("#E69F00", "#56B4E9", "#009E73")) +  # Couleurs adaptées au daltonisme (orange, bleu clair, vert)
+  scale_x_discrete(
+    breaks = 1:12, 
+    labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")  # Affichage des mois
+  ) +
+  labs(
+    title = paste("Somme des Quantités par Type d'Unité de vente des endives bio(", year_defined, ")", sep = ""),
+    x = "Mois", 
+    y = "Somme des Quantités",
+    fill= "Unité de conditionnement des produits"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 1),
+    axis.text.y = element_text(color = "blue")
+  )
+
+```
+
+
+
+```{r}
+
+# Filtrer et transformer les données pour les produits non biologiques
+agg_data_bio_month <- big_data %>%
+  filter(year == year_defined, productIsOrganic == FALSE) %>%  # Filtrer pour les produits non biologiques
+  mutate(
+    productConditioningQuantity_converted = mapply(convert_to_kg, productConditioningQuantity, productConditioningUnit),  # Conversion en kg
+    month_number = month(orderDate),  # Extraire le numéro du mois
+    month_label = month(orderDate, label = TRUE, abbr = TRUE)  # Extraire le mois avec abréviation (ex: "Jan", "Feb", etc.)
+  ) %>%
+  group_by(month_number, productConditioningUnit) %>%  # Grouper par mois et type d'unité
+  summarise(
+    total_quantity = sum(orderQuantity, na.rm = TRUE),  # Somme des `orderQuantity` par mois et type d'unité
+    count_orders = n(),  # Nombre d'ordres dans chaque groupe
+    .groups = "drop"
+  )
+
+# Créer un graphique avec les mois en x et les histogrammes séparés par `productConditioningUnit`
+ggplot(agg_data_bio_month, aes(x = factor(month_number), y = total_quantity, fill = productConditioningUnit)) +
+  geom_bar(stat = "identity", position = "dodge", alpha = 0.7) +  # Utilisation de `dodge` pour des histogrammes séparés
+  scale_fill_manual(values = c("#E69F00", "#56B4E9", "#009E73")) +  # Couleurs adaptées au daltonisme (orange, bleu clair, vert)
+  scale_x_discrete(
+    breaks = 1:12, 
+    labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")  # Affichage des mois
+  ) +
+  labs(
+    title = paste("Somme des Quantités par Type d'Unité de vente des endives non bio (", year_defined, ")", sep = ""),
+    x = "Mois", 
+    y = "Somme des Quantités ",
+    fill = "Unité de conditionnement des produits"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 0.5, hjust = 1),
+    axis.text.y = element_text(color = "blue")
+  )
+
+```
